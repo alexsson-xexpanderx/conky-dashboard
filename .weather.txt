@@ -1,2 +1,18 @@
-5.0
-03d
+units=metric
+city=Cluj-Napoca
+icon=03d
+description=scattered clouds
+temp=25.7
+feels=25.1
+temp_min=25.7
+temp_max=25.8
+humidity=29
+pressure=1023
+wind_speed=2.6
+wind_deg=190
+clouds=46
+visibility=10000
+sunrise=1789877366
+sunset=1789921737
+tz=10800
+observed=1789908078

@@ -1,270 +1,323 @@
 #!/usr/bin/env bash
-# shellcheck source=/dev/null
+#
+# Report whether updates are waiting, one "Name: Status" line per checker.
+#
+# The status wording is a contract with lua/dashboard.lua, which keys off it:
+#   "<Name>: Updates available"      -> red dot, counted as pending
+#   "<Name>: No updates available"   -> green dot
+#   "<Name>: Unknown"                -> amber dot; the check could not run
+#
+# A checker that cannot reach the network must report Unknown rather than
+# guessing, otherwise a flaky connection shows up as a phantom update.
 
+set -u
+
+readonly PROGNAME="${0##*/}"
+
+RELEASE=""
+OUTPUT=""
+CHECK_SBOPKG=0
+CHECK_KERNEL=0
+CHECK_NVIDIA=0
+CHECK_CHROME=0
+CHECK_SKYPE=0
 
 ###############################
-# Functions
+# Helpers
 ###############################
-_check_args()
-{
-    if [[ ! $2 || $2 == "-"* ]]; then
-        echo "Argument $1 requires an argument. Exciting... "
-        exit 1
+
+_die() {
+    printf '%s: %s\n' "$PROGNAME" "$1" >&2
+    exit 1
+}
+
+_need_value() {
+    # $1 = flag, $2 = the value that followed it (may be unset)
+    if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+        _die "$1 requires an argument."
     fi
 }
 
-
-_printhelp(){
-    echo -e "### Prompt for Slackware and optional updates. ###\n"
-	echo -e "Syntax ./slackware_updates.bash\n\
-			 \n-r|--release \t[14.2/current]\n\
-			 \nOptional\
-			 \n--sbopkg \t\tShow Sbopkg update\
-			 \n--nvidia \t\tShow Nvidia update\
-			 \n--google-chrome \tShow Google-Chrome update\
-			 \n--skype \t\tShow Skype update\
-			 \n--kernel \t\tShow Linux update"
-	exit 0
+_report() {
+    printf '%s: %s\n' "$1" "$2"
 }
 
-_sbopkg_version_web()
-{
-	if [[ "$1" == "current" ]]; then
-		readonly GITHUB="https://raw.githubusercontent.com/"
-		readonly PONCE=$GITHUB"Ponce/slackbuilds/master/ChangeLog.txt"
-		readonly SBOPKG_VERSION_WEB=$(curl -s "$PONCE" | head -n1)
-	elif [[ "$1" == "14.2" ]]; then
-		readonly SBOPKG_VERSION_WEB=$(curl \
-		                              -s \
-					                  "https://slackbuilds.org/ChangeLog.txt" \
-					                  | head -n1)
-	else
-		echo "$1 not supported."
-		exit 1
-	fi
+# One EXIT trap for both the lock and the temp file; setting two would mean
+# the second silently replacing the first.
+_cleanup() {
+    [[ -n "${TMPFILE:-}" ]] && rm -f "$TMPFILE"
+    [[ -n "${LOCKDIR:-}" ]] && rm -rf "$LOCKDIR"
+    return 0
 }
 
-_sbopkg_version_local()
-{
-	if [[ "$1" == "current" ]]; then
-		readonly SBOPKG_VERSION_LOCAL=$(< \
-		                                /var/lib/sbopkg/SBo-git/ChangeLog.txt \
-		                                head -n1)
-	elif [[ "$1" == "14.2" ]]; then
-		readonly SBOPKG_VERSION_LOCAL=$(< /var/lib/sbopkg/SBo/ChangeLog.txt \
-		                                head -n1)
-	else
-		echo "$1 not supported."
-		exit 1
-	fi
+# The panel re-runs this on a timer, so a slow network check must not get a
+# second copy stacked on top of it.  mkdir is atomic on every filesystem worth
+# caring about; the pid inside lets a crashed run be cleaned up rather than
+# wedging the lock forever.
+_acquire_lock() {
+    local dir="${TMPDIR:-/tmp}/slackware_updates-$(id -u).lock" owner
+
+    if mkdir "$dir" 2>/dev/null; then
+        LOCKDIR="$dir"; echo $$ >"$dir/pid"; return 0
+    fi
+
+    owner="$(cat "$dir/pid" 2>/dev/null)"
+    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+        return 1                       # a live run holds it
+    fi
+
+    rm -rf "$dir" 2>/dev/null
+    if mkdir "$dir" 2>/dev/null; then
+        LOCKDIR="$dir"; echo $$ >"$dir/pid"; return 0
+    fi
+    return 1
 }
 
-_check_slackpkg_updates()
-{
-	rm /var/lock/slackpkg.* > /dev/null 2>&1 # Unlock
+_printhelp() {
+    cat <<EOF
+Report pending updates for Slackware and a few out-of-tree packages.
 
-	if /usr/sbin/slackpkg check-updates 2> /dev/null \
-	   | grep -q "AVAILABLE UPDATES" ; then
-		echo "Slackpkg: Updates available"
-	else
-		echo "Slackpkg: No updates available"
-	fi
+Usage: $PROGNAME -r <release> [options]
 
-	rm /var/lock/slackpkg.* > /dev/null 2>&1 # Unlock
+  -r, --release <14.2|current>  Which SlackBuilds tree to compare against.
+                                Required by --sbopkg.
+  -o, --output <file>           Write to <file> atomically instead of stdout,
+                                so a reader never sees a half-written file.
+
+Optional checks (all off by default):
+      --sbopkg                  SlackBuilds tree is behind
+  -k, --kernel                  A newer kernel exists on kernel.org
+      --nvidia                  NVIDIA driver is behind
+      --google-chrome           Google Chrome is behind
+      --skype                   Skype is behind
+
+  -h, --help                    This text.
+
+slackpkg is always checked.  check-updates itself works as a normal user;
+only clearing a stale /var/lock/slackpkg.* needs root, and that step is
+skipped when not running as root.
+EOF
 }
 
-_check_sbopkg_updates()
-{
-	_sbopkg_version_web "$RELEASE"
-	_sbopkg_version_local "$RELEASE"
-
-	if [[ -n $SBOPKG_VERSION_WEB ]]; then
-
-		if [[ "$SBOPKG_VERSION_WEB" == "$SBOPKG_VERSION_LOCAL" ]]; then
-			echo "Sbopkg: No updates available"
-		else
-			echo "Sbopkg: Updates available"
-		fi
-	fi
+# Print the first line of a URL's body, or nothing on failure.
+_fetch_first_line() {
+    curl --silent --show-error --fail --location --max-time 20 "$1" 2>/dev/null \
+        | head -n1
 }
 
-_kernel_version_web()
-{
-	VERSION=$(echo "$1" | awk -F "." '{print $1}')
-	SUBVERSION=$(echo "$1" | awk -F "." '{print $2}')
-	KERNEL_LINK="https://cdn.kernel.org/pub/linux/kernel/v"
-	readonly KERNEL_VERSION_WEB=$(w3m \
-	                              -dump \
-				                  "$KERNEL_LINK$VERSION.x"/ \
-				                  | grep "ChangeLog-$VERSION.$SUBVERSION" \
-				                  | sort -V \
-				                  | tail -n1 \
-								  | awk '{print $1}' \
-				                  | sed 's/ChangeLog-//g')
-}
-
-_kernel_version_local()
-{
-	readonly KERNEL_VERSION_LOCAL=$(uname -r)
-}
-
-_check_kernel_updates()
-{
-	_kernel_version_local
-	_kernel_version_web "$KERNEL_VERSION_LOCAL"
-
-	if [[ -n "$KERNEL_VERSION_WEB" ]]; then
-
-		if [[ "$KERNEL_VERSION_WEB" == "$KERNEL_VERSION_LOCAL" ]]; then
-			echo "Linux: No updates available"
-		else
-			echo "Linux: Updates available"
-		fi
-	fi
-}
-
-_nvidia_version_local()
-{
-	readonly NVIDIA_VER_LOCAL=$(nvidia-smi \
-	                            | grep "Driver Version" \
-					            | awk '{print $6}')
-}
-
-_nvidia_version_web()
-{
-	readonly NVIDIA_VER_WEB=$(curl \
-	                          "https://developer.nvidia.com/vulkan-driver" -s \
-							  | grep "Vulkan Beta Driver Downloads" \
-							  | awk -F "Linux driver version " '{print $2}' \
-							  | awk '{print $1}' \
-							  | tr -d '[:space:]')
-}
-
-_check_nvidia_updates()
-{
-	_nvidia_version_local
-	_nvidia_version_web
-
-	if [[ -n "$NVIDIA_VER_WEB" ]]; then
-
-		if [[ "$NVIDIA_VER_WEB" == "$NVIDIA_VER_LOCAL" ]]; then
-			echo "Nvidia: No updates available"
-		else
-			echo "Nvidia: Updates available"
-		fi
-	fi
-}
-
-_check_google_chrome_updates()
-{
-	ROOT_LINK=https://dl.google.com/linux/direct/
-	RPM_LINK=google-chrome-stable_current_x86_64.rpm
-	VAR_LOG=/var/log/packages/google-chrome-
-
-	GOOGLE_CHROME_VERSION=$(wget -qO- $ROOT_LINK$RPM_LINK \
-							| head -c96 \
-							| strings \
-							| rev \
-							| awk -F"[:-]" '/emorhc/ { print $1 "-" $2 }' \
-							| rev)
-
-	if echo "$GOOGLE_CHROME_VERSION" | grep -Fq '-'; then
-		GOOGLE_CHROME_VERSION=${GOOGLE_CHROME_VERSION%-*}
-	fi
-
-	if /bin/ls "$VAR_LOG$GOOGLE_CHROME_VERSION"-* >/dev/null 2>&1 ; then
-		echo "Google-Chrome: No updates available"
-	else
-		echo "Google-Chrome: Updates available"
- 	fi
-
-
-}
-
-_check_skype_updates()
-{
-	ROOT_LINK=https://repo.skype.com/latest/
-	RPM_LINK=skypeforlinux-64.rpm
-	VAR_LOG=/var/log/packages/skypeforlinux-
-
-	SKYPE_VERSION=$(wget -qO- $ROOT_LINK$RPM_LINK \
-					| head -c96 \
-					| strings \
-					| rev \
-					| awk -F"[:-]" '/xunilrofepyks/ { print $2 }' \
-					| rev)
-
-	if /bin/ls "$VAR_LOG$SKYPE_VERSION"-* >/dev/null 2>&1 ; then
-		echo "Skype: No updates available"
-	else
-		echo "Skype: Updates available"
- 	fi
-
-
-}
 ###############################
-# Check arguments
+# Checkers
 ###############################
-while (( "$#" )); do
+
+_check_slackpkg() {
+    local out
+
+    # check-updates only reads, so it works as a normal user.  Clearing a
+    # stale lock does need root, so skip it rather than failing noisily.
+    if [[ $EUID -eq 0 ]]; then
+        rm -f /var/lock/slackpkg.* 2>/dev/null
+    fi
+
+    if ! command -v /usr/sbin/slackpkg >/dev/null 2>&1; then
+        _report Slackpkg "Unknown"
+        return
+    fi
+
+    out="$(/usr/sbin/slackpkg check-updates 2>/dev/null)" || true
+
+    if [[ -z "$out" ]]; then
+        _report Slackpkg "Unknown"
+    elif grep -q "AVAILABLE UPDATES" <<<"$out"; then
+        _report Slackpkg "Updates available"
+    else
+        _report Slackpkg "No updates available"
+    fi
+
+    if [[ $EUID -eq 0 ]]; then
+        rm -f /var/lock/slackpkg.* 2>/dev/null
+    fi
+}
+
+_check_sbopkg() {
+    local web local_ver changelog
+
+    case "$RELEASE" in
+        current)
+            web="$(_fetch_first_line \
+                "https://raw.githubusercontent.com/Ponce/slackbuilds/master/ChangeLog.txt")"
+            changelog=/var/lib/sbopkg/SBo-git/ChangeLog.txt
+            ;;
+        14.2)
+            web="$(_fetch_first_line "https://slackbuilds.org/ChangeLog.txt")"
+            changelog=/var/lib/sbopkg/SBo/ChangeLog.txt
+            ;;
+        *)
+            _die "--sbopkg needs -r current or -r 14.2 (got '${RELEASE:-none}')."
+            ;;
+    esac
+
+    local_ver="$(head -n1 "$changelog" 2>/dev/null)"
+
+    if [[ -z "$web" || -z "$local_ver" ]]; then
+        _report Sbopkg "Unknown"
+    elif [[ "$web" == "$local_ver" ]]; then
+        _report Sbopkg "No updates available"
+    else
+        _report Sbopkg "Updates available"
+    fi
+}
+
+_check_kernel() {
+    local running series latest
+
+    running="$(uname -r)"
+    series="${running%%.*}"
+
+    if ! command -v w3m >/dev/null 2>&1; then
+        _report Linux "Unknown"
+        return
+    fi
+
+    # The index lists ChangeLog-<version> files; the highest is the newest.
+    latest="$(w3m -dump "https://cdn.kernel.org/pub/linux/kernel/v${series}.x/" 2>/dev/null \
+        | grep -o "ChangeLog-${series}\.[0-9.]*" \
+        | sed 's/ChangeLog-//' \
+        | sort -V \
+        | tail -n1)"
+
+    if [[ -z "$latest" ]]; then
+        _report Linux "Unknown"
+    elif [[ "$running" == "$latest"* ]]; then
+        _report Linux "No updates available"
+    else
+        _report Linux "Updates available"
+    fi
+}
+
+_check_nvidia() {
+    local installed web
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        _report Nvidia "Unknown"
+        return
+    fi
+
+    installed="$(nvidia-smi 2>/dev/null | grep -o 'Driver Version: [0-9.]*' | awk '{print $3}')"
+
+    # NOTE: this reads NVIDIA's *Vulkan beta* page, which is normally ahead of
+    # the stable driver, so a match is unlikely even when fully up to date.
+    # Kept as-is to preserve the original behaviour; point it at whichever
+    # channel you actually track.
+    web="$(curl --silent --fail --max-time 20 "https://developer.nvidia.com/vulkan-driver" 2>/dev/null \
+        | grep -o 'Linux driver version [0-9.]*' \
+        | head -n1 \
+        | awk '{print $4}')"
+
+    if [[ -z "$installed" || -z "$web" ]]; then
+        _report Nvidia "Unknown"
+    elif [[ "$installed" == "$web" ]]; then
+        _report Nvidia "No updates available"
+    else
+        _report Nvidia "Updates available"
+    fi
+}
+
+# Both Chrome and Skype ship RPMs whose version is readable from the first few
+# hundred bytes, which avoids downloading the whole package just to compare.
+_rpm_lead_version() {
+    wget --quiet --timeout=20 --tries=2 -O- "$1" 2>/dev/null \
+        | head -c 96 \
+        | strings \
+        | grep -oE "$2"'-[0-9][0-9A-Za-z.]*' \
+        | head -n1 \
+        | sed "s/^$2-//"
+}
+
+_check_installed_version() {
+    # $1 = display name, $2 = /var/log/packages prefix, $3 = upstream version
+    local name="$1" prefix="$2" version="$3"
+
+    if [[ -z "$version" ]]; then
+        _report "$name" "Unknown"
+    elif compgen -G "${prefix}${version}-*" >/dev/null; then
+        _report "$name" "No updates available"
+    else
+        _report "$name" "Updates available"
+    fi
+}
+
+_check_google_chrome() {
+    local version
+    version="$(_rpm_lead_version \
+        "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" \
+        "google-chrome-stable")"
+    version="${version%%-*}"
+    _check_installed_version "Google-Chrome" "/var/log/packages/google-chrome-" "$version"
+}
+
+_check_skype() {
+    local version
+    version="$(_rpm_lead_version "https://repo.skype.com/latest/skypeforlinux-64.rpm" \
+        "skypeforlinux")"
+    version="${version%%-*}"
+    _check_installed_version "Skype" "/var/log/packages/skypeforlinux-" "$version"
+}
+
+###############################
+# Arguments
+###############################
+
+while (( $# )); do
     case "$1" in
-		-h|--help)
-			_printhelp
-			exit 0
-			;;
-    	-r|--release)
-			_check_args "$1" "$2"
-			readonly RELEASE="$2"
-			shift 2
-			;;
-    	-k|--kernel)
-			readonly KERNEL="True"
-			shift 1
-			;;
-    	--nvidia)
-			readonly NVIDIA="True"
-			shift 1
-			;;
-    	--sbopkg)
-			readonly SBOPKG="True"
-			shift 1
-			;;
-    	--google-chrome)
-			readonly GOOGLE_CHROME="True"
-			shift 1
-			;;
-    	--skype)
-			readonly SKYPE="True"
-			shift 1
-			;;
-    	-*) # unsupported flags
-      		echo "Invalid argument $1. Exciting... "
-      		exit 1
-      		;;
-  esac
+        -h|--help)       _printhelp; exit 0 ;;
+        -r|--release)    _need_value "$1" "${2:-}"; RELEASE="$2"; shift 2 ;;
+        -o|--output)     _need_value "$1" "${2:-}"; OUTPUT="$2";  shift 2 ;;
+        -k|--kernel)     CHECK_KERNEL=1; shift ;;
+        --nvidia)        CHECK_NVIDIA=1; shift ;;
+        --sbopkg)        CHECK_SBOPKG=1; shift ;;
+        --google-chrome) CHECK_CHROME=1; shift ;;
+        --skype)         CHECK_SKYPE=1;  shift ;;
+        --)              shift; break ;;
+        # Without these two arms an unrecognised word matches nothing, never
+        # shifts, and the loop spins forever.
+        -*)              _die "unknown option '$1' (try --help)." ;;
+        *)               _die "unexpected argument '$1' (try --help)." ;;
+    esac
 done
 
+if (( CHECK_SBOPKG )) && [[ -z "$RELEASE" ]]; then
+    _die "--sbopkg requires -r current or -r 14.2."
+fi
 
 ###############################
-# Main script
+# Main
 ###############################
-_check_slackpkg_updates
 
-if [[ -n $SBOPKG ]]; then
-	_check_sbopkg_updates
-fi
+run_all() {
+    _check_slackpkg
+    (( CHECK_SBOPKG )) && _check_sbopkg
+    (( CHECK_KERNEL )) && _check_kernel
+    (( CHECK_NVIDIA )) && _check_nvidia
+    (( CHECK_CHROME )) && _check_google_chrome
+    (( CHECK_SKYPE  )) && _check_skype
+    return 0
+}
 
-if [[ -n $KERNEL ]]; then
-	_check_kernel_updates
-fi
+trap _cleanup EXIT INT TERM
 
-if [[ -n $NVIDIA ]]; then
-	_check_nvidia_updates
-fi
+if [[ -n "$OUTPUT" ]]; then
+    # Only the automated path locks; a manual run to stdout should always work
+    # even while the panel's own refresh is in flight.
+    if ! _acquire_lock; then
+        exit 0                         # a run is already under way: not an error
+    fi
 
-if [[ -n $GOOGLE_CHROME ]]; then
-	_check_google_chrome_updates
-fi
-
-if [[ -n $SKYPE ]]; then
-	_check_skype_updates
+    # Write somewhere else and rename, so the panel never reads a file that is
+    # half-written or empty because the checks are still running.
+    TMPFILE="$(mktemp "${OUTPUT}.XXXXXX")" || _die "cannot create a temporary file."
+    run_all >"$TMPFILE"
+    mv -f "$TMPFILE" "$OUTPUT"
+    TMPFILE=""
+else
+    run_all
 fi
