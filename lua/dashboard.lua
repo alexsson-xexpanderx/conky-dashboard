@@ -187,6 +187,11 @@ local function build_roles()
         surface = { config.base,   config.opacity_surface },
         accent  = { config.accent, config.opacity_live    },
         warm    = { config.warm,   config.opacity_live    },
+        -- The daytime sun, and only it. Same colour as `warm` today, but a
+        -- role of its own so it can be retuned without dragging the CPU and
+        -- temperature ramps along with it -- they mean "hot", this means
+        -- "daylight", and they only coincide by luck.
+        sun     = { config.warm,   config.opacity_live    },
     }
 end
 
@@ -818,12 +823,16 @@ function icons.weather(cr, code, x, y, size, colour, accent, alpha)
     local num   = code:match("^(%d%d)") or "01"
     local night = code:sub(-1) == "n"
     local body  = night and moon or sun
+    -- The moon stays on `accent`: it is a pale object and warming it reads as
+    -- a harvest moon in every sky. Rain, bolt and snow stay on accent too --
+    -- warm precipitation looks like embers.
+    local body_colour = night and accent or "sun"
 
     if num == "01" then
-        body(cr, x, y, size, accent, alpha)
+        body(cr, x, y, size, body_colour, alpha)
 
     elseif num == "02" then
-        body(cr, x - size * 0.18, y - size * 0.16, size * 0.78, accent, alpha)
+        body(cr, x - size * 0.18, y - size * 0.16, size * 0.78, body_colour, alpha)
         cloud(cr, x + size * 0.10, y + size * 0.14, size * 0.78, colour, alpha)
 
     elseif num == "03" then
@@ -838,7 +847,7 @@ function icons.weather(cr, code, x, y, size, colour, accent, alpha)
         rain(cr, x, y + size * 0.26, size, accent, alpha, 4)
 
     elseif num == "10" then
-        body(cr, x - size * 0.24, y - size * 0.28, size * 0.62, accent, alpha)
+        body(cr, x - size * 0.24, y - size * 0.28, size * 0.62, body_colour, alpha)
         cloud(cr, x + size * 0.06, y - size * 0.06, size * 0.82, colour, alpha)
         rain(cr, x + size * 0.06, y + size * 0.30, size * 0.9, accent, alpha, 3)
 
@@ -1068,8 +1077,16 @@ end
 -- Vertical anchors for the weather block, all relative to its top edge.  Named
 -- because the arc has to be placed after the detail row, and getting that
 -- wrong silently draws one on top of the other.
-local WX_CITY_Y                = 12
-local WX_ICON_Y, WX_ICON_SIZE  = 108, 148  -- centre, then box size
+local WX_CITY_Y                = 10
+-- WX_ICON_SIZE is the box the glyph is *drawn to*, not the space it occupies.
+-- Two of the codes overflow it upwards: 02 and 10 place the sun at
+-- -0.16/-0.28 of size and the rays reach 0.581 of the sun's own size, so the
+-- topmost pixel lands about 0.61 of size above the centre where the box
+-- reserves 0.50. Centring the icon on the arithmetic middle of the gap is
+-- therefore wrong -- it collided with the city caption, leaving three pixels.
+-- Measure a render before moving these; the overflow is invisible in the
+-- numbers alone.
+local WX_ICON_Y, WX_ICON_SIZE  = 122, 148  -- centre, then nominal box size
 local WX_TEMP_Y, WX_DESC_Y     = 228, 250
 local WX_RULE_Y                = 266
 local WX_GLYPH_Y, WX_VALUE_Y   = 284, 310
@@ -1262,7 +1279,12 @@ end
 
 -- Bytes per second in the largest unit that keeps the number small.
 local function format_rate(bps)
-    if bps >= 1048576 then return string.format("%.1f MiB/s", bps / 1048576) end
+    if bps >= 1048576 then
+        local mib = bps / 1048576
+        -- Three significant figures.  Past 100 MiB/s the tenth is noise, and
+        -- it is two characters wide on the busiest line in the panel.
+        return string.format(mib >= 100 and "%.0f MiB/s" or "%.1f MiB/s", mib)
+    end
     if bps >= 1024    then return string.format("%.0f KiB/s", bps / 1024) end
     return string.format("%.0f B/s", bps)
 end
@@ -1343,7 +1365,12 @@ end
 local function section_network(cr, w, y, alpha, measure)
     local net = stats.net
     if not net or not net.name then return 0 end
-    local H = 108
+    -- 124 not 108: the peaks sit on their own line under the readings.  Side
+    -- by side they collided on a saturated link -- "934 MiB/s" and its own
+    -- peak label do not both fit in half the panel width -- and shrinking the
+    -- type to make them fit would hide the one figure that explains why the
+    -- two halves of the graph are not to the same scale.
+    local H = 124
     if measure then return H end
 
     text(cr, "NETWORK", PAD, y, { size = 11.5, colour = "label", alpha = alpha })
@@ -1368,19 +1395,28 @@ local function section_network(cr, w, y, alpha, measure)
     cairo_rectangle(cr, gx, axis, gw, 1)
     cairo_fill(cr)
 
-    -- Current readings, each with the full-scale value of its own half.
+    -- Current readings, each with the full-scale value of its own half.  The
+    -- peak is labelled rather than left as a bare figure: because the halves
+    -- are scaled independently, it is the only thing on screen that says the
+    -- two are not drawn to the same scale.  Without the word, an upload peak
+    -- of 135 KiB/s drawn as tall as a 5.1 MiB/s download reads as symmetry
+    -- rather than as a 39x magnification.
     local row  = gy + NET_GRAPH_H + 26
     local mid  = gx + gw / 2
 
     arrow(cr, gx + 6, row - 4, 11, false, "accent", alpha)
     text(cr, format_rate(net.down), gx + 18, row, { size = 13.5, alpha = alpha })
-    text(cr, format_rate(down_peak), mid - 10, row,
-         { size = 9.5, colour = "label", align = "right", alpha = alpha * 0.8 })
-
     arrow(cr, mid + 6, row - 4, 11, true, "text", alpha)
     text(cr, format_rate(net.up), mid + 18, row, { size = 13.5, alpha = alpha })
-    text(cr, format_rate(up_peak), gx + gw, row,
-         { size = 9.5, colour = "label", align = "right", alpha = alpha * 0.8 })
+
+    -- Each half of the plot is drawn to its own peak, so these two are the
+    -- full-scale values -- the only thing on screen saying the halves are not
+    -- comparable by height.
+    local scale_row = row + 16
+    text(cr, "peak " .. format_rate(down_peak), gx + 18, scale_row,
+         { size = 9.5, colour = "label", alpha = alpha * 0.8 })
+    text(cr, "peak " .. format_rate(up_peak), mid + 18, scale_row,
+         { size = 9.5, colour = "label", alpha = alpha * 0.8 })
 
     return H
 end

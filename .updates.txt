@@ -1,2 +1,2 @@
-Slackpkg: Updates available
-Sbopkg: Updates available
+Slackpkg: No updates available
+Sbopkg: No updates available

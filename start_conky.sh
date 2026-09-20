@@ -32,10 +32,37 @@ esac
 # Matching on the executable name first matters: a plain `pkill -f "conky -c
 # $conf"` also matches any shell whose command line quotes that path --
 # including the one running this script.
+#
+# Comparing the *resolved* config path matters just as much.  A substring test
+# against "$conf" only catches instances spelled with the same absolute path,
+# so one started the way the header above suggests --
+#
+#     conky -c configs/dashboard.conf &
+#
+# -- survives every restart and quietly draws a second panel over the first.
+# A relative path is resolved against that process's cwd, not ours.
+conf_real="$(readlink -f -- "$conf" 2>/dev/null || printf '%s' "$conf")"
+
 for pid in $(pgrep -x conky 2>/dev/null || true); do
-    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$conf"; then
-        kill "$pid" 2>/dev/null || true
-    fi
+    mapfile -d '' -t args < "/proc/$pid/cmdline" 2>/dev/null || continue
+
+    cfg=""
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            -c|--config) cfg="${args[i+1]-}" ;;
+            --config=*)  cfg="${args[i]#--config=}" ;;
+        esac
+    done
+    [ -n "$cfg" ] || continue
+
+    case "$cfg" in
+        /*) abs="$cfg" ;;
+        *)  cwd="$(readlink -- "/proc/$pid/cwd" 2>/dev/null)" || continue
+            abs="$cwd/$cfg" ;;
+    esac
+    abs="$(readlink -f -- "$abs" 2>/dev/null || printf '%s' "$abs")"
+
+    [ "$abs" = "$conf_real" ] && kill "$pid" 2>/dev/null || true
 done
 
 conky -c "$conf" ${passthrough[@]+"${passthrough[@]}"} &

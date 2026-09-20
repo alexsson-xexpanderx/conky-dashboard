@@ -192,7 +192,15 @@ ceiling does not quietly move the point where things start looking hot — same
 reasoning as the theme it came from.
 
 Note there is no green: "nothing to do" de-emphasises to `label` weight rather
-than turning a colour the palette does not contain.
+than turning a colour the palette does not contain. The same rule killed a
+yellow sun — a literal sun colour would be a fourth hue with no other home,
+and the palette is shared with the calendar widget so both read as one theme.
+The daytime sun uses `sun`, which resolves to `warm` today: sun-like without
+inventing anything. It is a separate role rather than `warm` itself because
+`warm` means "hot" in the CPU and temperature ramps and this means "daylight";
+they coincide by luck, not by meaning. The moon, rain, bolt and snow stay on
+`accent` — a warmed moon reads as a harvest moon, and warm precipitation reads
+as embers.
 
 ## Data collection is fork-free
 
@@ -281,6 +289,17 @@ so hover and click behaviour cannot be tested programmatically — it needs a
 human. And `import`/`xwd` against the conky window return a blank image, so the
 panel cannot be screenshotted through X; `screenshot.png` is produced by
 `conky_dashboard_render`, not captured from the desktop.
+
+**Killing the old instance needs the *resolved* config path.** `start_conky.sh`
+used to grep each `/proc/$pid/cmdline` for the absolute `$conf` string, which
+only matches instances spelled that exact way. One started the way this file
+and the script's own header suggest -- `conky -c configs/dashboard.conf &` --
+never matched, so it survived every restart and drew a second panel on top of
+the first. Two panels at 0.2s each, one slightly stale, is easy to mistake for
+a rendering bug. It now parses `-c` / `--config` / `--config=` out of the
+cmdline, resolves a relative value against that process's own `/proc/$pid/cwd`
+(not ours), and compares `readlink -f` results. Check `pgrep -x conky` before
+concluding the panel itself is misbehaving.
 
 **`pkill -f` matches your own shell.** `pkill -f "conky -c $conf"` also matches
 any process whose command line quotes that path, including the shell running
