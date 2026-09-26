@@ -198,7 +198,7 @@ row name to an action; rows with no entry are inert and show no hover state:
 
 ```lua
 update_actions = {
-    Slackpkg = { cmd = "/home/alexsson/Programs/slackpkg/slackpkg-gui" },
+    Slackpkg = { script = "slackpkg-gui/slackpkg-gui" },
     Sbopkg   = { script = "sbopkg_update.sh", terminal = true },
 },
 ```

@@ -1,9 +1,19 @@
 __pycache__/
 *.pyc
 
+# Collector output. Regenerated on a timer and machine-specific, so tracking
+# it means every git status shows two files churning. Both readers cope with
+# the file being absent -- the weather section withdraws, the updates list says
+# "checking..." -- so a fresh clone is fine without them.
+.updates.txt
+.weather.txt
+
 # transient files from an in-flight data refresh
 .updates.txt.*
 .weather-*
+
+# byte-compiled Lua, if luac is ever run without -p
+luac.out
 
 # OpenWeatherMap API key -- never commit this
 .owm_key

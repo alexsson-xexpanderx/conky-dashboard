@@ -14,7 +14,13 @@ temperature gauges. Those were all removed from here for that reason — along
 with their samplers, which is why the panel no longer calls `conky_parse` at
 all. Before adding a widget, check `lua_widgets_modernized.lua` for it.
 
-Every pixel is drawn with Cairo from `lua/dashboard.lua`. `conky.text` is empty
+`slackpkg-gui/` is a second program in this repository: a PyQt6 front end for
+Slackware's package manager, with its own CLAUDE.md. It lives here because the
+panel's Slackpkg row launches it and the two share a palette — change one
+palette and change the other. Nothing in the panel imports it, and it runs
+standalone.
+
+Every pixel of the panel is drawn with Cairo from `lua/dashboard.lua`. `conky.text` is empty
 on purpose, so adding a `${...}` variable to it is **not** how you add
 something to this panel — you draw it in the Lua.
 
@@ -134,12 +140,30 @@ the result, so the probe happens once, not per frame.
 When adding a widget, follow the same pattern: return 0 from `measure` rather
 than drawing a placeholder.
 
-The weather block's vertical anchors are named constants (`WX_CITY_Y` …
-`WX_ARC_Y`) because the daylight arc has to be placed *after* the detail row;
-getting that wrong silently draws one on top of the other. The arc is a
-squashed ellipse — a true semicircle that wide would be 180px tall — and its
-path is built under a scaled CTM but stroked after restoring it, or the scale
-distorts the line width along with the shape.
+The weather block's vertical anchors are **derived from measured ink, not from
+`WX_ICON_SIZE`**. That constant is the size the glyph is drawn *to*; what it
+puts on the panel is 1.22x bigger and asymmetric — worst case `0.642 * size`
+above the centre (`10d`, the sun's rays clearing a cloud) and `0.574 * size`
+below (`01d`, the bare sun), i.e. 180px of ink for a 148px box. Centring the
+icon on the arithmetic middle of the gap therefore collides with the city
+caption above *and* the temperature below, and it did both, twice. `WX_ICON_Y`
+and `WX_TEMP_Y` are now computed from those ratios plus `WX_GAP`, and the rest
+of the block hangs off `WX_TEMP_Y`, so changing the icon size moves everything
+in step.
+
+To re-measure after a drawing change, render each code in isolation rather than
+reading the geometry out of the source — append a function to a copy of
+`dashboard.lua` so it closes over the file-scope `icons` table, call
+`icons.weather` onto a blank surface for each of `01d 01n 02d 02n 03d 04d 09d
+10d 10n 11d 13d 50d`, and read the extreme non-transparent rows off the pixels.
+Both previous attempts at these numbers were wrong because they were derived by
+hand from one code.
+
+The daylight arc has to be placed *after* the detail row; getting that wrong
+silently draws one on top of the other. The arc is a squashed ellipse — a true
+semicircle that wide would be 180px tall — and its path is built under a scaled
+CTM but stroked after restoring it, or the scale distorts the line width along
+with the shape.
 
 The crescent moon is built by clipping to the moon's disc and then filling
 everything except an offset shadow disc. An even-odd "punch" cannot do it: a
@@ -161,6 +185,30 @@ before the bottom bar's boxes. Rows are single-click; only the power bar arms.
 `action_for` resolves an entry to a command and returns nil when the target is
 missing, so a row whose program is not installed simply stays inert rather
 than looking live.
+
+`section_updates` also draws a **refresh button** in its header and registers
+it in `ui.rows`' sibling `ui.controls`, which `conky_mouse_event` checks
+*before* the rows. It calls `spawn_update_check()` — factored out of
+`refresh_updates` — so it fires regardless of `config.refresh_updates`, and a
+manual check still works when the schedule is switched off. The script's own
+mkdir lock stops a click landing on top of a scheduled run from stacking two
+copies. `ui.checking_at` drives an eight-second "checking…" caption; nothing
+polls for completion, the next `sample_updates` tick simply picks the new file
+up.
+
+**Testing a click needs the refresh intervals set to 0.** `last_run` starts at
+zero in a fresh Lua state, so the very first `conky_dashboard_render` spawns
+both collectors on its own — which looks exactly like the click having worked.
+Two such results here were meaningless before this was noticed. Render a copy
+with `refresh_updates`/`refresh_weather` patched to 0, then dispatch
+`conky_mouse_event` and watch `.updates.txt`'s mtime.
+
+**A circular-arrow glyph needs its head at the *end* of the arc**, pointing
+along the tangent in the direction of travel. Put it at the start and it aims
+into the arc: the result renders as a ring with a nub, legible at 6x and
+meaningless at 1x. `icons.refresh` draws at 15px, not 13 — the head has to
+survive being four pixels across. Check glyph work by rendering at real size
+and magnifying with `CAIRO_FILTER_NEAREST`, never by eye at 1x.
 
 **The autostart entry's `--delay` is load-bearing.** `configs/dashboard.conf`
 reads `_NET_WORKAREA` at parse time, and conky applies `--pause` *after*
@@ -306,9 +354,11 @@ any process whose command line quotes that path, including the shell running
 the script. `start_conky.sh` filters `pgrep -x conky` by reading
 `/proc/$pid/cmdline` instead.
 
-**Fonts.** Defaults to Noto Sans, with `Noto Sans Light`/`Medium` as separate
-families — Cairo's toy font API only knows normal and bold, so weights have to
-come through the family name. Fontconfig substitutes silently when a family is
+**Fonts.** Defaults to Noto Sans, with `Noto Sans Light` as a separate family
+for the two large readouts — Cairo's toy font API only knows normal and bold,
+so any other weight has to come through the family name. There is no
+`font_medium`: it was declared and never read, which made setting it look like
+it would do something. Fontconfig substitutes silently when a family is
 missing, so a wrong-looking panel may just be a missing font. No icon font is
 needed: every glyph is a Cairo path.
 

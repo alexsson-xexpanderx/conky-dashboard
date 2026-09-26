@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher for the slackpkg GUI. Runs as your normal user: the package list is
+# built from world-readable files, and root is requested per action via pkexec.
+exec python3 -c 'import sys; sys.path.insert(0, "'"$(cd "$(dirname "$0")" && pwd)"'"); from slackpkg_gui.app import main; sys.exit(main())' "$@"

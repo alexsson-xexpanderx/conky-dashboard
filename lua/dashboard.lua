@@ -23,7 +23,6 @@ local config = {
     -- Fonts.  Any family fontconfig can resolve; weights are separate families.
     font        = "Noto Sans",
     font_light  = "Noto Sans Light",
-    font_medium = "Noto Sans Medium",
 
     -- Palette, matching Conky-Calendar-Extra's modernized theme: white for
     -- everything structural, one pink accent, and a warm colour used only at
@@ -115,7 +114,7 @@ local config = {
     --   script   path relative to this repository
     --   terminal open it in a terminal emulator instead of detaching silently
     update_actions = {
-        Slackpkg = { cmd = "/home/alexsson/Programs/slackpkg/slackpkg-gui" },
+        Slackpkg = { script = "slackpkg-gui/slackpkg-gui" },
         Sbopkg   = { script = "sbopkg_update.sh", terminal = true },
     },
 
@@ -604,11 +603,11 @@ end
 
 local last_run = { updates = -math.huge, weather = -math.huge }
 
-local function refresh_updates(now)
-    if (config.refresh_updates or 0) <= 0 then return end
-    if now - last_run.updates < config.refresh_updates then return end
-    if not readable(BASE .. "/slackware_updates.bash") then return end
-    last_run.updates = now
+-- Spawning is separate from the timer so the refresh button can reuse it
+-- without having to fake the clock. The script takes its own mkdir lock, so a
+-- click landing on top of a scheduled run cannot stack two copies.
+local function spawn_update_check()
+    if not readable(BASE .. "/slackware_updates.bash") then return false end
 
     local args = { "-r", shell_quote(config.slackware_release) }
     for name, enabled in pairs(config.update_checks or {}) do
@@ -621,6 +620,14 @@ local function refresh_updates(now)
 
     spawn_detached(shell_quote(BASE .. "/slackware_updates.bash") .. " " ..
                    table.concat(args, " "))
+    return true
+end
+
+
+local function refresh_updates(now)
+    if (config.refresh_updates or 0) <= 0 then return end
+    if now - last_run.updates < config.refresh_updates then return end
+    if spawn_update_check() then last_run.updates = now end
 end
 
 -- The key comes from the config if someone insists, otherwise from a file
@@ -869,6 +876,36 @@ end
 
 -- ---- Weather detail glyphs ------------------------------------------------
 
+function icons.refresh(cr, x, y, size, colour, alpha)
+    -- A circular arrow needs more room than it looks like it does. The head
+    -- must sit at the *end* of the arc pointing along the direction of travel;
+    -- putting it at the start aims it into the arc and the whole thing renders
+    -- as a ring with a nub, which is what the first attempt did. Checked by
+    -- drawing it at real size and magnifying, not by eye at 1x.
+    local r = size * 0.34
+    set_colour(cr, colour, alpha)
+    cairo_set_line_width(cr, math.max(1.0, size * 0.10))
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND)
+    cairo_new_path(cr)
+    cairo_arc(cr, x, y, r, -0.60 * math.pi, 1.05 * math.pi)
+    cairo_stroke(cr)
+
+    local a      = 1.05 * math.pi
+    local px, py = x + math.cos(a) * r, y + math.sin(a) * r
+    local tx, ty = -math.sin(a), math.cos(a)     -- tangent: where the arc goes
+    local nx, ny =  math.cos(a),  math.sin(a)    -- radial
+    local h      = size * 0.44
+    cairo_new_path(cr)
+    cairo_move_to(cr, px + tx * h * 0.62, py + ty * h * 0.62)
+    cairo_line_to(cr, px - tx * h * 0.18 + nx * h * 0.50,
+                      py - ty * h * 0.18 + ny * h * 0.50)
+    cairo_line_to(cr, px - tx * h * 0.18 - nx * h * 0.50,
+                      py - ty * h * 0.18 - ny * h * 0.50)
+    cairo_close_path(cr)
+    cairo_fill(cr)
+end
+
+
 function icons.droplet(cr, x, y, size, colour, alpha)
     set_colour(cr, colour, alpha)
     local r = size * 0.30
@@ -1038,6 +1075,8 @@ local ui = {
     armed       = nil,      -- id of a power button awaiting confirmation
     armed_at    = 0,
     rows        = {},       -- clickable update rows, rebuilt on every frame
+    controls    = {},       -- small in-section buttons, likewise per frame
+    checking_at = 0,        -- os.time() of a manual refresh, for the caption
     width       = 0,        -- last known window size, for the mouse hook
     height      = 0,
     buttons     = {},       -- hit boxes rebuilt on every frame
@@ -1078,19 +1117,37 @@ end
 -- because the arc has to be placed after the detail row, and getting that
 -- wrong silently draws one on top of the other.
 local WX_CITY_Y                = 10
--- WX_ICON_SIZE is the box the glyph is *drawn to*, not the space it occupies.
--- Two of the codes overflow it upwards: 02 and 10 place the sun at
--- -0.16/-0.28 of size and the rays reach 0.581 of the sun's own size, so the
--- topmost pixel lands about 0.61 of size above the centre where the box
--- reserves 0.50. Centring the icon on the arithmetic middle of the gap is
--- therefore wrong -- it collided with the city caption, leaving three pixels.
--- Measure a render before moving these; the overflow is invisible in the
--- numbers alone.
-local WX_ICON_Y, WX_ICON_SIZE  = 122, 148  -- centre, then nominal box size
-local WX_TEMP_Y, WX_DESC_Y     = 228, 250
-local WX_RULE_Y                = 266
-local WX_GLYPH_Y, WX_VALUE_Y   = 284, 310
-local WX_ARC_Y                 = 326
+local WX_ICON_SIZE             = 148
+
+-- WX_ICON_SIZE is the size the glyph is *drawn to*; the ink it actually puts
+-- on the panel is bigger, in both directions, and by different amounts.
+-- Measured by rendering every code in isolation and reading the extreme rows
+-- off the pixels -- do not re-derive these by reading the drawing code, that
+-- is how they were got wrong twice:
+--
+--     worst above centre  0.642 x size   10d, the sun's rays over a cloud
+--     worst below centre  0.574 x size   01d, the bare sun
+--
+-- which is 180px of ink for a 148px box, 1.22x. Centring the icon on the
+-- arithmetic middle of the space leaves it colliding with the caption above
+-- and the temperature below, which is exactly what happened.
+local WX_ICON_OVER_TOP         = 0.642
+local WX_ICON_OVER_BOTTOM      = 0.574
+local WX_GAP                   = 14     -- clear space wanted around the glyph
+local WX_TEMP_CAP              = 43     -- temperature cap height above baseline
+
+local WX_ICON_Y = math.ceil(WX_CITY_Y + 1 + WX_GAP
+                            + WX_ICON_SIZE * WX_ICON_OVER_TOP)
+local WX_TEMP_Y = math.ceil(WX_ICON_Y + WX_ICON_SIZE * WX_ICON_OVER_BOTTOM
+                            + WX_GAP + WX_TEMP_CAP)
+
+-- Everything below the reading keeps its spacing relative to it, so changing
+-- the icon size moves the whole lower block as one instead of needing seven
+-- numbers edited in step.
+local WX_DESC_Y                = WX_TEMP_Y + 22
+local WX_RULE_Y                = WX_TEMP_Y + 38
+local WX_GLYPH_Y, WX_VALUE_Y   = WX_TEMP_Y + 56, WX_TEMP_Y + 82
+local WX_ARC_Y                 = WX_TEMP_Y + 98
 local DAYLIGHT_H               = 66
 
 local function duration(seconds)
@@ -1458,8 +1515,27 @@ local function section_updates(cr, w, y, alpha, measure)
     local pending = stats.updates_pending
 
     text(cr, "UPDATES", PAD, y, { size = 11.5, colour = "label", alpha = alpha })
-    if #stats.updates > 0 then
-        text(cr, pending > 0 and (pending .. " waiting") or "up to date", w - PAD, y,
+
+    -- Manual refresh. The scheduled check is every config.refresh_updates
+    -- seconds (15 minutes by default), so after upgrading something by hand
+    -- the row can sit there stale for a quarter of an hour stating a fact that
+    -- expired moments after it was measured. The hit box is deliberately
+    -- larger than the glyph -- 24px for an 13px icon -- because this sits in a
+    -- header, not a row, and a 13px target is not one.
+    ui.controls = {}
+    local rb = { x = w - PAD - 18, y = y - 13, w = 24, h = 22, id = "refresh" }
+    local rb_hover = ui.pointer and hit(rb, ui.pointer.x, ui.pointer.y) or false
+    local checking = (os.time() - ui.checking_at) < 8
+    ui.controls[#ui.controls + 1] = rb
+    icons.refresh(cr, rb.x + rb.w / 2, rb.y + rb.h / 2, 15,
+                  (rb_hover or checking) and "accent" or "label",
+                  alpha * (rb_hover and 1 or 0.85))
+
+    if checking then
+        text(cr, "checking…", rb.x - 8, y,
+             { size = 11.5, align = "right", alpha = alpha, colour = "accent" })
+    elseif #stats.updates > 0 then
+        text(cr, pending > 0 and (pending .. " waiting") or "up to date", rb.x - 8, y,
              { size = 11.5, align = "right", alpha = alpha,
                colour = pending > 0 and "accent" or "label" })
     end
@@ -1763,6 +1839,20 @@ function conky_mouse_event(event)
 
     elseif kind == "button_down" and event.button == "left" then
         disarm_if_stale()
+
+        -- Section controls first: they sit in a header, above the rows, and
+        -- none of them changes the system -- the refresh only re-runs the
+        -- read-only checker.
+        for _, box in ipairs(ui.controls) do
+            if hit(box, event.x, event.y) then
+                ui.armed = nil
+                if box.id == "refresh" and spawn_update_check() then
+                    ui.checking_at = os.time()
+                    last_run.updates = monotonic()
+                end
+                return
+            end
+        end
 
         -- Update rows are plain single-click: nothing here destroys anything,
         -- so they do not need the bottom bar's confirmation step.
